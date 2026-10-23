@@ -150,28 +150,38 @@
   }
  ],
  "summary": {
-  "threshold_m": 1250,
-  "share_buffer": 0.7354,
-  "share_network": 0.3657,
-  "gap_pp": 36.97,
-  "ci_cluster": [
-   30.47,
-   42.47
-  ],
   "ci_cell": [
    32.87,
    40.87
   ],
-  "verdict": "supported",
-  "n_cells": 8,
-  "n_clusters": 3,
-  "pop_total": 8560.0,
-  "pop_affected": 3165.0,
+  "ci_cluster": [
+   30.47,
+   42.47
+  ],
   "circuity_median": 1.38,
   "circuity_p90": 1.52,
+  "gap_pp": 36.97,
+  "n_cells": 8,
+  "n_clusters": 3,
+  "network_ge_euclid": true,
+  "node_snap_sensitivity": {
+   "share_network": 0.3039,
+   "gap_pp": 43.15,
+   "ci_cluster": [
+    37.1,
+    49.2
+   ]
+  },
+  "pop_affected": 3165.0,
+  "pop_total": 8560.0,
+  "registered": true,
+  "share_buffer": 0.7354,
+  "share_network": 0.3657,
   "snap_median_m": 29.55,
+  "snap_method": "edge",
   "snap_over_200m_share": 0.0748,
-  "network_ge_euclid": true
+  "threshold_m": 1250,
+  "verdict": "supported"
  },
  "sensitivity": [
   {

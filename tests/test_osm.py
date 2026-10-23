@@ -10,8 +10,16 @@ import pytest
 from pyproj import Geod
 from shapely.geometry import Point
 
+from geonet import registered
 from geonet.city import City
-from geonet.osm import load_extract, save_extract, to_lonlat, to_projected
+from geonet.osm import (
+    check_registered_extract,
+    load_extract,
+    read_meta,
+    save_extract,
+    to_lonlat,
+    to_projected,
+)
 from geonet.synthetic import synthetic_city
 
 BENGALURU_LON, BENGALURU_LAT = 77.5946, 12.9716
@@ -161,3 +169,130 @@ def test_distances_in_metres_not_degrees() -> None:
             lon, lat, _ = geod.fwd(BENGALURU_LON, BENGALURU_LAT, azimuth, metres)
             px, py = to_projected(lon, lat, UTM43N)
             assert disc.contains(Point(float(px), float(py))) is inside, (azimuth, metres)
+
+
+# ------------------------------------------------------------ registered-extract check
+
+
+def _registered_city(reach: float = 2_500.0, kinds=("hospital", "clinic", "doctors")) -> City:
+    """A tiny extract in the registered CRS whose nodes reach ``reach`` m beyond the AOI."""
+    aoi = registered.registered_aoi()
+    xmin, ymin, xmax, ymax = aoi
+    nodes = pd.DataFrame(
+        {
+            "node_id": [1, 2, 3, 4],
+            "x": [xmin - reach, xmax + reach, xmin - reach, xmax + reach],
+            "y": [ymin - reach, ymin - reach, ymax + reach, ymax + reach],
+        }
+    )
+    edges = pd.DataFrame(
+        {"u": [1], "v": [2], "length_m": [10.0], "highway": ["footway"], "geometry": [None]}
+    )
+    fac = pd.DataFrame(
+        {
+            "fid": [f"node/{i}" for i in range(len(kinds))],
+            "kind": list(kinds),
+            "x": [(xmin + xmax) / 2] * len(kinds),
+            "y": [(ymin + ymax) / 2] * len(kinds),
+        }
+    )
+    return City(nodes, edges, fac, registered.CRS, aoi)
+
+
+GOOD_META = {"fetch_buffer_m": 2_500}
+
+
+def test_registered_aoi_is_the_10_km_square_around_the_centre() -> None:
+    xmin, ymin, xmax, ymax = registered.registered_aoi()
+    assert (xmax - xmin, ymax - ymin) == (10_000.0, 10_000.0)
+    cx, cy = to_projected(*registered.CENTRE_LONLAT, registered.CRS)
+    assert (xmin + xmax) / 2 == pytest.approx(float(cx), abs=0.5)
+    assert (ymin + ymax) / 2 == pytest.approx(float(cy), abs=0.5)
+    assert xmin == int(xmin) and ymin == int(ymin)  # centre rounded to the metre
+
+
+def test_a_good_registered_extract_has_no_problems() -> None:
+    assert check_registered_extract(_registered_city(), GOOD_META) == []
+    # an AOI within 1 m of the registered one is accepted
+    city = _registered_city()
+    moved = City(
+        city.nodes,
+        city.edges,
+        city.facilities,
+        city.crs,
+        tuple(v + 0.9 for v in city.aoi),
+    )
+    assert check_registered_extract(moved, GOOD_META) == []
+
+
+def test_aoi_more_than_one_metre_off_is_a_problem() -> None:
+    city = _registered_city()
+    xmin, ymin, xmax, ymax = city.aoi
+    moved = City(city.nodes, city.edges, city.facilities, city.crs, (xmin + 1.5, ymin, xmax, ymax))
+    problems = check_registered_extract(moved, GOOD_META)
+    assert len(problems) == 1 and "AOI" in problems[0]
+
+
+def test_crs_other_than_the_registered_one_is_a_problem() -> None:
+    city = _registered_city()
+    other = City(city.nodes, city.edges, city.facilities, "EPSG:32644", city.aoi)
+    assert any("CRS" in p for p in check_registered_extract(other, GOOD_META))
+
+
+@pytest.mark.parametrize("meta", [{}, {"fetch_buffer_m": 2_499}, {"fetch_buffer_m": 1_000}])
+def test_missing_or_small_fetch_margin_is_a_problem(meta) -> None:
+    problems = check_registered_extract(_registered_city(), meta)
+    assert len(problems) == 1 and "fetch_buffer_m" in problems[0]
+
+
+def test_a_larger_fetch_margin_is_fine() -> None:
+    assert check_registered_extract(_registered_city(), {"fetch_buffer_m": 3_000}) == []
+
+
+def test_network_must_reach_2000_m_beyond_the_aoi_on_every_side() -> None:
+    assert check_registered_extract(_registered_city(reach=2_000.0), GOOD_META) == []
+    problems = check_registered_extract(_registered_city(reach=1_999.0), GOOD_META)
+    assert len(problems) == 1 and "2,000 m beyond the AOI" in problems[0]
+    for side in ("west", "east", "south", "north"):
+        assert side in problems[0]
+
+    # only one side short: drop the nodes that reach the west
+    city = _registered_city()
+    nodes = city.nodes[city.nodes["x"] > city.aoi[0] - 100.0]
+    nodes = pd.concat(
+        [nodes, pd.DataFrame({"node_id": [9], "x": [city.aoi[0] - 100.0], "y": [city.aoi[1]]})]
+    )
+    short = City(nodes, city.edges, city.facilities, city.crs, city.aoi)
+    problems = check_registered_extract(short, GOOD_META)
+    assert len(problems) == 1 and "west" in problems[0] and "east" not in problems[0]
+
+
+def test_facility_kind_outside_the_registered_set_is_a_problem() -> None:
+    problems = check_registered_extract(_registered_city(kinds=("hospital", "pharmacy")), GOOD_META)
+    assert len(problems) == 1 and "pharmacy" in problems[0]
+
+
+def test_degree_like_coordinates_are_a_problem() -> None:
+    city = _registered_city()
+    nodes = city.nodes.copy()
+    nodes.loc[0, "x"] = 77.59  # degrees, not metres
+    fac = city.facilities.copy()
+    fac.loc[0, "y"] = 12.97
+    bad = City(nodes, city.edges, fac, city.crs, city.aoi)
+    problems = check_registered_extract(bad, GOOD_META)
+    assert any("node coordinates look like degrees" in p for p in problems)
+    assert any("facility coordinates look like degrees" in p for p in problems)
+
+
+def test_read_meta_round_trips_and_names_the_fetch_script(tmp_path) -> None:
+    city, _ = synthetic_city()
+    save_extract(city, tmp_path, meta_extra={"fetch_buffer_m": 2_500})
+    meta = read_meta(tmp_path)
+    assert meta["fetch_buffer_m"] == 2_500 and meta["crs"] == city.crs
+    with pytest.raises(FileNotFoundError, match=r"scripts/fetch_osm\.py"):
+        read_meta(tmp_path / "nowhere")
+
+
+def test_check_works_on_a_saved_and_reloaded_extract(tmp_path) -> None:
+    save_extract(_registered_city(), tmp_path, meta_extra=GOOD_META)
+    assert check_registered_extract(load_extract(tmp_path), read_meta(tmp_path)) == []

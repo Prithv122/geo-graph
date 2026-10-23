@@ -17,14 +17,27 @@ import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
+from geonet import registered
+
 Access = dict[str, Any]
 
 LOCAL_CRS = "LOCAL:metres"
-SPOT_CHECK_SEED = 20261023
+SPOT_CHECK_SEED = registered.SEED
 SPOT_CHECK_N = 20
 SPOT_CHECK_TOLERANCE = 0.15
-# Registered rule: at least 16 of 20 within 15% (80%); other sample sizes scale it up.
+# Amendment 1: a row also passes when the two distances differ by at most 100 m, because the
+# outside router joins the street differently, which matters on short routes.
+SPOT_CHECK_TOLERANCE_M = 100.0
+# Registered rule: at least 16 of 20 rows pass (80%); other sample sizes scale it up.
 SPOT_CHECK_PASS_SHARE = 0.8
+NOT_VALIDATED = "not validated by the spot-check"
+NOT_REGISTERED_WORDS = "not the registered analysis (no verdict)"
+NOT_REGISTERED_NOTE = (
+    "The registered analysis is 5 km/h for 15 min, 2,000 resamples, seed 20261023, the "
+    "registered study area and population resolution, and an extract fetched with a margin of "
+    "at least 2,500 m; the numbers below are descriptive and carry no verdict."
+)
+NA = "n/a"
 ROUTER_URL = (
     "https://www.openstreetmap.org/directions?engine=fossgis_osrm_foot"
     "&route={lat1:.6f}%2C{lon1:.6f}%3B{lat2:.6f}%2C{lon2:.6f}"
@@ -58,28 +71,41 @@ def load_access(path: str | Path) -> Access:
 # ------------------------------------------------------------------------ formatting
 
 
-def _pct(share: float) -> str:
-    return f"{100 * share:.1f}%"
+def _pct(share: float | None) -> str:
+    return NA if share is None else f"{100 * share:.2f}%"
 
 
-def _pp(value: float) -> str:
-    return f"{value:.1f} pp"
+def _pp(value: float | None) -> str:
+    return NA if value is None else f"{value:.2f} pp"
 
 
-def _ci(lo: float, hi: float) -> str:
-    return f"[{lo:.1f}, {hi:.1f}] pp"
+def _bracket(lo: float | None, hi: float | None) -> str:
+    return NA if lo is None or hi is None else f"[{lo:.2f}, {hi:.2f}]"
+
+
+def _ci(lo: float | None, hi: float | None) -> str:
+    return NA if lo is None or hi is None else f"{_bracket(lo, hi)} pp"
+
+
+def _ratio(value: float | None) -> str:
+    return NA if value is None else f"{value:.2f}"
 
 
 def _people(value: float) -> str:
     return f"{round(value):,}"
 
 
-def _metres(value: float) -> str:
-    return f"{round(value):,} m"
+def _metres(value: float | None) -> str:
+    return NA if value is None else f"{round(value):,} m"
 
 
-def verdict_words(verdict: str) -> str:
-    """The registered verdict as a phrase; unknown codes are an error, not a guess."""
+def verdict_words(verdict: str | None) -> str:
+    """The registered verdict as a phrase; unknown codes are an error, not a guess.
+
+    ``None`` means the run was not the registered analysis, which carries no verdict.
+    """
+    if verdict is None:
+        return NOT_REGISTERED_WORDS
     try:
         return VERDICT_WORDS[verdict]
     except KeyError:
@@ -111,7 +137,18 @@ def summary_table(access: Access) -> str:
     threshold = _metres(s["threshold_m"])
     if primary:
         threshold += f" ({primary['speed_kmh']:g} km/h for {primary['minutes']:g} min)"
-    affected_share = s["pop_affected"] / s["pop_total"] if s["pop_total"] else float("nan")
+    affected_share = s["pop_affected"] / s["pop_total"] if s["pop_total"] else None
+    boot = cfg.get("bootstrap", {})
+    resamples = (
+        f"{boot['n']:,} resamples, seed {boot['seed']}" if "n" in boot and "seed" in boot else NA
+    )
+    node = s.get("node_snap_sensitivity")
+    node_text = (
+        f"gap {_pp(node['gap_pp'])} {_bracket(*node['ci_cluster'])}, "
+        f"network share {_pct(node['share_network'])}"
+        if node
+        else NA
+    )
     rows = [
         ["Walking threshold", threshold],
         ["Residents with access, straight-line buffer", _pct(s["share_buffer"])],
@@ -119,17 +156,20 @@ def summary_table(access: Access) -> str:
         ["Gap (buffer minus network)", _pp(s["gap_pp"])],
         [f"{conf} CI, cluster bootstrap", _ci(*s["ci_cluster"])],
         [f"{conf} CI, cell bootstrap (sensitivity)", _ci(*s["ci_cell"])],
-        ["Verdict", verdict_words(s["verdict"])],
+        ["Bootstrap", resamples],
+        ["Snapping method", s.get("snap_method", NA)],
+        ["Nearest-node snapping, superseded by Amendment 1 (sensitivity)", node_text],
+        ["Verdict", verdict_words(s.get("verdict"))],
         [
             "Residents the buffer counts as served but the network does not",
             f"{_people(s['pop_affected'])} of {_people(s['pop_total'])} ({_pct(affected_share)})",
         ],
         [
             "Circuity (network / straight line), median and 90th percentile",
-            f"{s['circuity_median']:.2f} and {s['circuity_p90']:.2f}",
+            f"{_ratio(s.get('circuity_median'))} and {_ratio(s.get('circuity_p90'))}",
         ],
-        ["Snapping distance, median", _metres(s["snap_median_m"])],
-        ["Residents snapped more than 200 m", _pct(s["snap_over_200m_share"])],
+        ["Snapping distance, median", _metres(s.get("snap_median_m"))],
+        ["Residents snapped more than 200 m", _pct(s.get("snap_over_200m_share"))],
         [
             "Network distance at least the straight line in every cell",
             "yes" if s["network_ge_euclid"] else "no",
@@ -157,7 +197,7 @@ def sensitivity_table(access: Access) -> str:
                 cells.append("-")
                 continue
             lo, hi = r["ci_cluster"]
-            text = f"{r['gap_pp']:.1f} pp [{lo:.1f}, {hi:.1f}], {_metres(r['threshold_m'])}"
+            text = f"{_pp(r['gap_pp'])} {_bracket(lo, hi)}, {_metres(r['threshold_m'])}"
             cells.append(f"**{text}**" if (sp, mn) == primary_key else text)
         body.append(cells)
     return _table(["Speed \\ Minutes"] + [f"{mn:g} min" for mn in minutes], body)
@@ -177,11 +217,16 @@ def _zone_rows(zones: list[dict[str, Any]]) -> list[list[str]]:
     ]
 
 
+def _gap_key(z: dict[str, Any]) -> float:
+    """Sort key for the gap: a zone without population has no gap and sorts last."""
+    return -z["gap_pp"] if z["gap_pp"] is not None else math.inf
+
+
 def zones_table(access: Access, top: int = 10) -> str:
     """Top zones by gap, then top zones by residents affected (two markdown tables)."""
     zones = access["zones"]
     header = ["Zone", "Residents", "Buffer", "Network", "Gap", "Residents affected"]
-    by_gap = sorted(zones, key=lambda z: (-z["gap_pp"], str(z["cluster"])))[:top]
+    by_gap = sorted(zones, key=lambda z: (_gap_key(z), str(z["cluster"])))[:top]
     by_pop = sorted(zones, key=lambda z: (-z["pop_affected"], str(z["cluster"])))[:top]
     return (
         f"**Top {len(by_gap)} zones by gap**\n\n{_table(header, _zone_rows(by_gap))}\n\n"
@@ -252,13 +297,27 @@ def spot_check_sheet(
     return pd.DataFrame(rows, columns=columns)
 
 
+def require_registered(access: Access) -> None:
+    """Refuse anything but a registered access result: the sheet validates the verdict."""
+    if access.get("summary", {}).get("registered") is not True:
+        raise ValueError(
+            "the spot-check applies to the registered analysis only; this access file is "
+            "not the registered analysis (no verdict to validate)"
+        )
+
+
+def _required(n: int) -> int:
+    """Rows that must pass: 16 of 20, and the same 80% rounded up for other sheet sizes."""
+    return math.ceil(SPOT_CHECK_PASS_SHARE * n - 1e-9)
+
+
 def _spot_check_markdown(sheet: pd.DataFrame, csv_name: str) -> str:
     n = len(sheet)
-    need = math.ceil(SPOT_CHECK_PASS_SHARE * n - 1e-9)
+    need = _required(n)
     lines = [
         "# Spot-check sheet",
         "",
-        f"{n} cells drawn at random (fixed seed) from the access result. For each row:",
+        f"{n} cells drawn at random (fixed seed) from the registered access result. For each row:",
         "",
         "1. Open the link. It asks the openstreetmap.org foot router for the walk from the "
         "cell centroid to the facility the network analysis chose.",
@@ -267,9 +326,15 @@ def _spot_check_markdown(sheet: pd.DataFrame, csv_name: str) -> str:
         "3. Do not adjust the link's endpoints: the point of the check is that the router "
         "never sees the analysis network.",
         "",
-        f"Pass rule (pre-registered): at least {need} of {n} rows have the network distance "
-        f"within {round(100 * SPOT_CHECK_TOLERANCE)}% of the router's. "
-        "A miss is investigated and written up before the result is reported.",
+        "Pass rule (pre-registered, Amendment 1): a row passes when our network distance and "
+        f"the router's differ by at most {round(100 * SPOT_CHECK_TOLERANCE)}% **or** at most "
+        f"{round(SPOT_CHECK_TOLERANCE_M)} m (the router joins the street differently, which "
+        f"matters on short routes). The facility is the one the network analysis chose. "
+        f"The sheet passes with at least {need} of {n} rows.",
+        "",
+        f"If fewer than {need} of {n} pass, the verdict is still reported but marked "
+        f'"{NOT_VALIDATED}", and every miss is investigated and written up in `NOTES.md` '
+        "before the README reports the result.",
         "",
     ]
     rows = [
@@ -293,7 +358,11 @@ def write_spot_check(
     n: int = SPOT_CHECK_N,
     seed: int = SPOT_CHECK_SEED,
 ) -> pd.DataFrame:
-    """Write the sheet as CSV (for the owner to fill) and as markdown (instructions + links)."""
+    """Write the sheet as CSV (for the owner to fill) and as markdown (instructions + links).
+
+    Only a registered access result gets a sheet.
+    """
+    require_registered(access)
     sheet = spot_check_sheet(access, n=n, seed=seed)
     path_csv, path_md = Path(path_csv), Path(path_md)
     for p in (path_csv, path_md):
@@ -303,19 +372,35 @@ def write_spot_check(
     return sheet
 
 
-def score_spot_check(path_csv: str | Path) -> dict[str, Any]:
-    """Score the owner-filled sheet by the registered rule (16 of 20 within 15%).
+def score_spot_check(path_csv: str | Path, access: Access) -> dict[str, Any]:
+    """Score the owner-filled sheet by the registered rule (Amendment 1).
 
-    Refuses a sheet with any blank or non-positive ``router_m``: a half-filled sheet
-    must not produce a verdict.
+    The seeded sheet is regenerated from ``access`` and the file must hold exactly those
+    cells (20, or every eligible cell when fewer than 20 exist), so a hand-picked or stale
+    sheet cannot be scored. A row passes when ours and the router's distances differ by at
+    most 15% of the router's or at most 100 m; the sheet passes with at least 16 of 20 rows
+    (80% rounded up for other sizes). A half-filled sheet is refused.
     """
-    df = pd.read_csv(path_csv)
-    for col in ("cell_id", "network_m", "router_m"):
+    require_registered(access)
+    expected = spot_check_sheet(access)
+    df = pd.read_csv(path_csv, dtype={"cell_id": str, "facility_fid": str})
+    for col in ("cell_id", "router_m"):
         if col not in df.columns:
             raise ValueError(f"spot-check sheet is missing column {col!r}")
+
+    want = sorted(expected["cell_id"])
+    got = sorted(df["cell_id"].astype(str))
+    if got != want:
+        extra, absent = sorted(set(got) - set(want)), sorted(set(want) - set(got))
+        raise ValueError(
+            f"the sheet is not the seeded draw from this access file: expected {len(want)} "
+            f"cells, found {len(got)}; not expected {extra[:3]}, missing {absent[:3]}"
+        )
+    df = df.set_index(df["cell_id"].astype(str)).loc[list(expected["cell_id"])]
+
     router = pd.to_numeric(df["router_m"], errors="coerce")
     blank = int(router.isna().sum())
-    if blank or df.empty:
+    if blank:
         raise ValueError(
             f"{blank} of {len(df)} rows have a blank or non-numeric router_m; "
             "fill every row before scoring"
@@ -323,20 +408,37 @@ def score_spot_check(path_csv: str | Path) -> dict[str, Any]:
     if (router <= 0).any():
         raise ValueError("router_m must be positive in every row")
 
-    rel = (df["network_m"] - router).abs() / router
-    within = rel <= SPOT_CHECK_TOLERANCE + 1e-12
+    ours = expected.set_index("cell_id")["network_m"].astype(float)
+    ours = ours.loc[router.index]
+    diff_m = (ours - router).abs()
+    rel = diff_m / router
+    within = (diff_m <= SPOT_CHECK_TOLERANCE_M + 1e-9) | (rel <= SPOT_CHECK_TOLERANCE + 1e-12)
     n = len(df)
-    required = math.ceil(SPOT_CHECK_PASS_SHARE * n - 1e-9)
+    required = _required(n)
     n_within = int(within.sum())
+    passed = n_within >= required
+    miss_ids = [str(c) for c in router.index[~within.to_numpy()]]
     return {
         "n": n,
         "n_within": n_within,
         "required": required,
-        "passed": n_within >= required,
+        "passed": passed,
+        "status": "validated" if passed else NOT_VALIDATED,
         "tolerance": SPOT_CHECK_TOLERANCE,
+        "tolerance_m": SPOT_CHECK_TOLERANCE_M,
         "median_rel_error": float(rel.median()),
         "max_rel_error": float(rel.max()),
-        "misses": [str(c) for c in df.loc[~within, "cell_id"]],
+        "misses": miss_ids,
+        "miss_details": [
+            {
+                "cell_id": c,
+                "network_m": float(ours[c]),
+                "router_m": float(router[c]),
+                "diff_m": float(diff_m[c]),
+                "rel_error": float(rel[c]),
+            }
+            for c in miss_ids
+        ],
         "rel_errors": [float(v) for v in rel],
     }
 
@@ -475,7 +577,7 @@ def _draw_cells(ax, access: Access, colour_of) -> None:
 def _title(access: Access, what: str) -> str:
     s = access["summary"]
     lo, hi = s["ci_cluster"]
-    return f"{what}\ngap {s['gap_pp']:.1f} pp ({_confidence_label(access)} CI {lo:.1f} to {hi:.1f})"
+    return f"{what}\ngap {s['gap_pp']:.2f} pp ({_confidence_label(access)} CI {lo:.2f} to {hi:.2f})"
 
 
 def status_map(access: Access, path: str | Path, city_edges: pd.DataFrame | None = None) -> Path:
@@ -520,10 +622,10 @@ def zone_gap_map(access: Access, path: str | Path) -> Path:
     from matplotlib.patches import Polygon
 
     zones = access["zones"]
-    gaps = [z["gap_pp"] for z in zones]
+    gaps = [z["gap_pp"] for z in zones if z["gap_pp"] is not None]
     norm = Normalize(vmin=0.0, vmax=max(max(gaps, default=0.0), 1.0))
     cmap = matplotlib.colormaps["viridis"]
-    gap_of = {z["cluster"]: z["gap_pp"] for z in zones}
+    gap_of = {z["cluster"]: (z["gap_pp"] or 0.0) for z in zones}
 
     fig = Figure(figsize=(8.6, 8), dpi=150)
     ax = fig.add_subplot(1, 1, 1)
@@ -539,7 +641,7 @@ def zone_gap_map(access: Access, path: str | Path) -> Path:
         outline = _hex_outline_xy(z["cluster"], to_xy) if to_xy is not None else None
         if outline is not None:
             patches.append(Polygon(outline, closed=True))
-            patch_colours.append(cmap(norm(z["gap_pp"])))
+            patch_colours.append(cmap(norm(z["gap_pp"] or 0.0)))
             drawn.add(z["cluster"])
     if patches:
         ax.add_collection(
@@ -588,22 +690,25 @@ def circuity_hist(access: Access, path: str | Path) -> Path:
     fig = Figure(figsize=(7, 4.2), dpi=150)
     ax = fig.add_subplot(1, 1, 1)
     ax.hist(ratios, bins=30, weights=weights, color="#0072B2", edgecolor="white", linewidth=0.4)
-    ax.axvline(
-        s["circuity_median"],
-        color="#D55E00",
-        linewidth=1.5,
-        label=f"median {s['circuity_median']:.2f}",
-    )
-    ax.axvline(
-        s["circuity_p90"],
-        color="#E69F00",
-        linewidth=1.5,
-        linestyle="--",
-        label=f"90th percentile {s['circuity_p90']:.2f}",
-    )
+    if s.get("circuity_median") is not None:
+        ax.axvline(
+            s["circuity_median"],
+            color="#D55E00",
+            linewidth=1.5,
+            label=f"median {s['circuity_median']:.2f}",
+        )
+    if s.get("circuity_p90") is not None:
+        ax.axvline(
+            s["circuity_p90"],
+            color="#E69F00",
+            linewidth=1.5,
+            linestyle="--",
+            label=f"90th percentile {s['circuity_p90']:.2f}",
+        )
     ax.set_xlabel("walking distance / straight-line distance to the nearest facility")
     ax.set_ylabel("residents")
-    ax.legend(fontsize=8)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
     ax.set_title("Circuity of the walking network (population-weighted)", fontsize=10)
     fig.tight_layout()
     return _save(fig, path)
@@ -650,12 +755,18 @@ def write_report(
     except RuntimeError as exc:
         figure_lines = [f"Figures were skipped: {exc}"]
 
+    verdict = s.get("verdict")
+    if verdict is None:
+        verdict_line = f"This run is **{verdict_words(None)}**. {NOT_REGISTERED_NOTE}"
+    else:
+        verdict_line = f"Verdict: **{verdict_words(verdict)}**."
+
     parts = [
         f"# {title}",
         "",
         f"Headline: the straight-line buffer overstates access by **{_pp(s['gap_pp'])}** "
         f"({_confidence_label(access)} cluster-bootstrap CI {_ci(lo, hi)}) at "
-        f"{_metres(s['threshold_m'])}. Verdict: **{verdict_words(s['verdict'])}**.",
+        f"{_metres(s['threshold_m'])}. {verdict_line}",
         "",
         f"Study area CRS {cfg['crs']}; {s['n_cells']:,} origin cells in {s['n_clusters']:,} zones; "
         f"{cfg['n_facilities']:,} facilities; {cfg['n_nodes']:,} network nodes and "
@@ -664,6 +775,8 @@ def write_report(
         "## Summary",
         "",
         summary_table(access),
+        "",
+        "Values are shown to 2 decimals; the verdict uses the unrounded values.",
         "",
         "## Sensitivity to walking speed and time",
         "",

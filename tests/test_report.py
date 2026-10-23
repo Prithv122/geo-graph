@@ -29,17 +29,54 @@ def test_load_access_has_expected_sections(access):
 
 def test_summary_table_formats_fixture_numbers(access):
     table = report.summary_table(access)
-    assert "| Residents with access, straight-line buffer | 73.5% |" in table
-    assert "| Residents with access, walking network | 36.6% |" in table
-    assert "| Gap (buffer minus network) | 37.0 pp |" in table
-    assert "| 95% CI, cluster bootstrap | [30.5, 42.5] pp |" in table
-    assert "| 95% CI, cell bootstrap (sensitivity) | [32.9, 40.9] pp |" in table
+    assert "| Residents with access, straight-line buffer | 73.54% |" in table
+    assert "| Residents with access, walking network | 36.57% |" in table
+    assert "| Gap (buffer minus network) | 36.97 pp |" in table
+    assert "| 95% CI, cluster bootstrap | [30.47, 42.47] pp |" in table
+    assert "| 95% CI, cell bootstrap (sensitivity) | [32.87, 40.87] pp |" in table
+    assert "| Bootstrap | 2,000 resamples, seed 20261023 |" in table
+    assert "| Snapping method | edge |" in table
     assert "| Verdict | H1 supported |" in table
-    assert "3,165 of 8,560 (37.0%)" in table
+    assert "3,165 of 8,560 (36.97%)" in table
     assert "1.38 and 1.52" in table
     assert "| Snapping distance, median | 30 m |" in table
-    assert "| Residents snapped more than 200 m | 7.5% |" in table
+    assert "| Residents snapped more than 200 m | 7.48% |" in table
     assert "1,250 m (5 km/h for 15 min)" in table
+
+
+def test_summary_table_shows_the_node_snap_sensitivity(access):
+    table = report.summary_table(access)
+    assert (
+        "| Nearest-node snapping, superseded by Amendment 1 (sensitivity) | "
+        "gap 43.15 pp [37.10, 49.20], network share 30.39% |"
+    ) in table
+
+
+def test_unregistered_summary_has_no_verdict(access):
+    access["summary"]["registered"] = False
+    access["summary"]["verdict"] = None
+    table = report.summary_table(access)
+    assert "| Verdict | not the registered analysis (no verdict) |" in table
+    assert "H1 supported" not in table
+
+
+def test_summary_table_guards_missing_values(access):
+    s = access["summary"]
+    s["circuity_median"] = s["circuity_p90"] = None
+    del s["node_snap_sensitivity"]
+    del s["snap_method"]
+    table = report.summary_table(access)
+    assert "median and 90th percentile | n/a and n/a |" in table
+    assert "| Nearest-node snapping, superseded by Amendment 1 (sensitivity) | n/a |" in table
+    assert "| Snapping method | n/a |" in table
+
+
+def test_zone_without_population_shows_na_and_sorts_last(access):
+    access["zones"][0].update(share_buffer=None, share_network=None, gap_pp=None)
+    text = report.zones_table(access, top=10)
+    assert "n/a" in text
+    by_gap = text.split("**Top 4 zones by residents affected**")[0]
+    assert by_gap.rindex("8760145a6ffffff") > by_gap.index("87618925bffffff")
 
 
 @pytest.mark.parametrize(
@@ -61,21 +98,25 @@ def test_unknown_verdict_is_an_error(access):
         report.summary_table(access)
 
 
+def test_verdict_words_for_none():
+    assert report.verdict_words(None) == "not the registered analysis (no verdict)"
+
+
 def test_sensitivity_table_is_speed_by_minutes(access):
     lines = report.sensitivity_table(access).splitlines()
     assert lines[0] == "| Speed \\ Minutes | 10 min | 15 min | 20 min |"
     assert len(lines) == 2 + 3  # header, rule, three speeds
-    assert lines[2].startswith("| 4 km/h | 0.0 pp [0.0, 5.5], 667 m |")
+    assert lines[2].startswith("| 4 km/h | 0.00 pp [0.00, 5.50], 667 m |")
     # the primary setting (5 km/h, 15 min) is the bold one in the middle row
-    assert "**37.0 pp [30.5, 42.5], 1,250 m**" in lines[3]
-    assert lines[4].endswith("| 0.0 pp [0.0, 5.5], 2,000 m |")
+    assert "**36.97 pp [30.47, 42.47], 1,250 m**" in lines[3]
+    assert lines[4].endswith("| 0.00 pp [0.00, 5.50], 2,000 m |")
 
 
 def test_zones_table_orders_by_gap_and_by_residents_affected(access):
     text = report.zones_table(access, top=2)
     by_gap, by_pop = text.split("**Top 2 zones by residents affected**")
     assert by_gap.index("87618925bffffff") < by_gap.index("8761892e9ffffff")
-    assert by_gap.count("|") and "100.0 pp" in by_gap
+    assert by_gap.count("|") and "100.00 pp" in by_gap
     assert by_pop.index("8761892e9ffffff") < by_pop.index("87618925bffffff")
     assert "1,925" in by_pop
     assert "8760145a6ffffff" not in text  # third and fourth zones are cut off by top=2
@@ -156,59 +197,161 @@ def test_write_spot_check_writes_csv_and_markdown(access, tmp_path):
     assert text.count("openstreetmap.org/directions") == 4
 
 
+def test_spot_check_instructions_state_amendment_1(access, tmp_path):
+    md = tmp_path / "sheet.md"
+    report.write_spot_check(access, tmp_path / "sheet.csv", md, n=20)
+    text = md.read_text(encoding="utf-8")
+    assert "Amendment 1" in text
+    assert "at most 15% **or** at most 100 m" in text
+    assert "The facility is the one the network analysis chose" in text
+    assert "not validated by the spot-check" in text
+    assert "NOTES.md" in text
+
+
+def test_write_spot_check_refuses_an_unregistered_result(access, tmp_path):
+    access["summary"]["registered"] = False
+    access["summary"]["verdict"] = None
+    with pytest.raises(ValueError, match="registered analysis only"):
+        report.write_spot_check(access, tmp_path / "s.csv", tmp_path / "s.md")
+    assert not (tmp_path / "s.csv").exists()
+
+
+def _with_cells(access: dict, n_cells: int, network_m=None) -> dict:
+    """The fixture with ``n_cells`` cells, so the sheet is the registered 20-cell draw."""
+    base = access["cells"][0]
+    access["cells"] = [
+        {
+            **base,
+            "cell_id": f"c{i:03d}",
+            "network_m": 500.0 + 40 * i if network_m is None else network_m,
+            "euclid_m": 400.0 + 30 * i,
+        }
+        for i in range(n_cells)
+    ]
+    return access
+
+
+def _filled_sheet(access: dict, tmp_path: Path, router=None) -> Path:
+    """Write the real sheet, then fill ``router_m`` (default: equal to our distance).
+
+    ``router`` maps the sheet's ``network_m`` column to the router distances.
+    """
+    csv = tmp_path / "sheet.csv"
+    report.write_spot_check(access, csv, tmp_path / "sheet.md")
+    df = pd.read_csv(csv)
+    df["router_m"] = df["network_m"] if router is None else router(df["network_m"])
+    df.to_csv(csv, index=False)
+    return csv
+
+
+def test_registered_sheet_has_twenty_rows(access):
+    sheet = report.spot_check_sheet(_with_cells(access, 30))
+    assert len(sheet) == 20 and sheet["cell_id"].is_unique
+
+
+def _router_off_by(k: int):
+    """Router distances that are double ours (far off, by % and by metres) in the first k rows."""
+
+    def router(net: pd.Series) -> pd.Series:
+        r = net.copy()
+        r.iloc[:k] = r.iloc[:k] * 2.0
+        return r
+
+    return router
+
+
 def test_pass_rule_for_the_registered_sample_is_16_of_20(access, tmp_path):
-    csv = tmp_path / "s.csv"
-    # 20 rows of a stand-in sheet; the cell ids do not matter to the scoring
-    df = pd.DataFrame({"cell_id": [f"c{i}" for i in range(20)], "network_m": 1000.0})
-    df["router_m"] = 1000.0
-    df.loc[16:, "router_m"] = 500.0  # 4 rows are off by 100%
-    df.to_csv(csv, index=False)
-    res = report.score_spot_check(csv)
+    _with_cells(access, 30)
+    csv = _filled_sheet(access, tmp_path, _router_off_by(4))
+    res = report.score_spot_check(csv, access)
     assert (res["n"], res["n_within"], res["required"], res["passed"]) == (20, 16, 16, True)
-    assert res["misses"] == ["c16", "c17", "c18", "c19"]
+    assert res["status"] == "validated"
+    assert len(res["misses"]) == 4 and len(res["miss_details"]) == 4
 
-    df.loc[15, "router_m"] = 500.0  # a fifth miss: 15 of 20
-    df.to_csv(csv, index=False)
-    res = report.score_spot_check(csv)
+    csv = _filled_sheet(access, tmp_path, _router_off_by(5))  # a fifth miss: 15 of 20
+    res = report.score_spot_check(csv, access)
     assert (res["n_within"], res["passed"]) == (15, False)
+    assert res["status"] == "not validated by the spot-check"
+    assert res["miss_details"][0]["diff_m"] > 100
 
 
-def test_tolerance_boundary_is_inclusive(tmp_path):
-    csv = tmp_path / "s.csv"
-    pd.DataFrame(
-        {"cell_id": ["a", "b"], "network_m": [115.0, 116.0], "router_m": [100.0, 100.0]}
-    ).to_csv(csv, index=False)
-    res = report.score_spot_check(csv)
-    assert res["n_within"] == 1  # 15% exactly counts, 16% does not
-    assert res["misses"] == ["b"]
-    assert res["max_rel_error"] == pytest.approx(0.16)
+def test_long_route_passes_on_15_percent_and_boundary_is_inclusive(access, tmp_path):
+    # 1,000 m routes: 100 m cannot rescue a row, only 15% can.
+    _with_cells(access, 20, network_m=1000.0)
+    inside = 1000.0 / 1.15  # ours is exactly 15% above the router's distance
+    csv = _filled_sheet(access, tmp_path, lambda net: net * 0 + inside)
+    assert report.score_spot_check(csv, access)["n_within"] == 20
+
+    csv = _filled_sheet(access, tmp_path, lambda net: net * 0 + 800.0)  # 200 m and 25% off
+    res = report.score_spot_check(csv, access)
+    assert res["n_within"] == 0 and res["passed"] is False
+
+
+def test_short_route_passes_within_100_metres_only(access, tmp_path):
+    # 300 m routes: a router answer of 200 m is 50% off but exactly 100 m off.
+    _with_cells(access, 20, network_m=300.0)
+    csv = _filled_sheet(access, tmp_path, lambda net: net * 0 + 200.0)
+    res = report.score_spot_check(csv, access)
+    assert res["n_within"] == 20 and res["max_rel_error"] == pytest.approx(0.5)
+
+    csv = _filled_sheet(access, tmp_path, lambda net: net * 0 + 199.0)  # 101 m and 51% off
+    assert report.score_spot_check(csv, access)["n_within"] == 0
+
+
+def test_score_requires_the_seeded_cells(access, tmp_path):
+    _with_cells(access, 30)
+    csv = _filled_sheet(access, tmp_path)
+    df = pd.read_csv(csv)
+
+    swapped = df.copy()
+    swapped.loc[0, "cell_id"] = "c999"  # a cell the seeded draw did not pick
+    swapped.to_csv(csv, index=False)
+    with pytest.raises(ValueError, match="not the seeded draw"):
+        report.score_spot_check(csv, access)
+
+    df.iloc[:19].to_csv(csv, index=False)  # a short sheet
+    with pytest.raises(ValueError, match="expected 20 cells, found 19"):
+        report.score_spot_check(csv, access)
+
+
+def test_score_with_fewer_than_twenty_eligible_cells_uses_all_of_them(access, tmp_path):
+    csv = _filled_sheet(access, tmp_path)  # the fixture has 8 cells
+    res = report.score_spot_check(csv, access)
+    assert (res["n"], res["required"], res["passed"]) == (8, 7, True)
+
+
+def test_score_refuses_an_unregistered_access_file(access, tmp_path):
+    csv = _filled_sheet(access, tmp_path)
+    access["summary"]["registered"] = False
+    with pytest.raises(ValueError, match="registered analysis only"):
+        report.score_spot_check(csv, access)
 
 
 def test_score_refuses_blank_router_m(access, tmp_path):
     csv = tmp_path / "sheet.csv"
-    report.write_spot_check(access, csv, tmp_path / "sheet.md", n=3)
+    report.write_spot_check(access, csv, tmp_path / "sheet.md")
     with pytest.raises(ValueError, match="blank"):
-        report.score_spot_check(csv)
+        report.score_spot_check(csv, access)
 
     df = pd.read_csv(csv)
     df["router_m"] = df["network_m"] * 1.05
     df.loc[1, "router_m"] = np.nan
     df.to_csv(csv, index=False)
-    with pytest.raises(ValueError, match="1 of 3"):
-        report.score_spot_check(csv)
+    with pytest.raises(ValueError, match="1 of 8"):
+        report.score_spot_check(csv, access)
 
     df["router_m"] = df["network_m"] * 1.05
     df.to_csv(csv, index=False)
-    assert report.score_spot_check(csv)["passed"] is True
+    assert report.score_spot_check(csv, access)["passed"] is True
 
 
-def test_score_refuses_non_positive_router_m(tmp_path):
-    csv = tmp_path / "s.csv"
-    pd.DataFrame({"cell_id": ["a"], "network_m": [100.0], "router_m": [0.0]}).to_csv(
-        csv, index=False
-    )
+def test_score_refuses_non_positive_router_m(access, tmp_path):
+    csv = _filled_sheet(access, tmp_path)
+    df = pd.read_csv(csv)
+    df.loc[0, "router_m"] = 0.0
+    df.to_csv(csv, index=False)
     with pytest.raises(ValueError, match="positive"):
-        report.score_spot_check(csv)
+        report.score_spot_check(csv, access)
 
 
 # --------------------------------------------------------------------------- figures
@@ -281,7 +424,7 @@ def test_write_report_without_matplotlib_still_writes_markdown(access, tmp_path,
     monkeypatch.setattr(report, "status_map", refuse)
     path = report.write_report(access, tmp_path)
     text = path.read_text(encoding="utf-8")
-    assert "Figures were skipped" in text and "37.0 pp" in text
+    assert "Figures were skipped" in text and "36.97 pp" in text
     assert not (tmp_path / "figures").exists() or not any((tmp_path / "figures").iterdir())
 
 
@@ -291,8 +434,9 @@ def test_write_report_mentions_gap_and_links_figures(access, tmp_path):
     assert path == tmp_path / "out" / "REPORT.md"
     text = path.read_text(encoding="utf-8")
     assert text.startswith("# Bengaluru test")
-    assert "37.0 pp" in text and "[30.5, 42.5] pp" in text
+    assert "36.97 pp" in text and "[30.47, 42.47] pp" in text
     assert "H1 supported" in text
+    assert "the verdict uses the unrounded values" in text
     assert "## Sensitivity" in text and "## Where the gap falls" in text
     for name in ("status_map.png", "zone_gap_map.png", "circuity_hist.png"):
         assert f"figures/{name}" in text
@@ -305,5 +449,24 @@ def test_report_numbers_come_from_the_access_dict(access, tmp_path):
     changed["summary"]["ci_cluster"] = [8.0, 16.5]
     changed["summary"]["verdict"] = "not_supported"
     text = report.write_report(changed, tmp_path).read_text(encoding="utf-8")
-    assert "12.3 pp" in text and "[8.0, 16.5] pp" in text and "H1 not supported" in text
-    assert "37.0 pp [" not in text.split("## Sensitivity")[0]
+    assert "12.30 pp" in text and "[8.00, 16.50] pp" in text and "H1 not supported" in text
+    assert "36.97 pp [" not in text.split("## Sensitivity")[0]
+
+
+def test_unregistered_report_says_so_and_has_no_verdict(access, tmp_path):
+    access["summary"]["registered"] = False
+    access["summary"]["verdict"] = None
+    text = report.write_report(access, tmp_path).read_text(encoding="utf-8")
+    head = text.split("## Summary")[0]
+    assert "not the registered analysis (no verdict)" in head
+    assert "H1 supported" not in text
+    assert "| Verdict | not the registered analysis (no verdict) |" in text
+
+
+def test_report_guards_missing_circuity_and_zone_gaps(access, tmp_path):
+    pytest.importorskip("matplotlib")
+    access["summary"]["circuity_median"] = access["summary"]["circuity_p90"] = None
+    access["zones"][0].update(share_buffer=None, share_network=None, gap_pp=None)
+    text = report.write_report(access, tmp_path).read_text(encoding="utf-8")
+    assert "n/a" in text
+    assert (tmp_path / "figures" / "circuity_hist.png").exists()

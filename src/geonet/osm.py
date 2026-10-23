@@ -15,6 +15,7 @@ import pandas as pd
 from pyproj import CRS, Transformer
 from pyproj.exceptions import CRSError
 
+from geonet import registered
 from geonet.city import EDGE_COLUMNS, FACILITY_COLUMNS, NODE_COLUMNS, City, require_columns
 from geonet.synthetic import SYNTHETIC_CRS
 
@@ -93,6 +94,17 @@ def save_extract(city: City, directory, meta_extra: dict | None = None) -> None:
     (out / META_FILE).write_text(text, encoding="utf-8", newline="\n")
 
 
+def read_meta(directory) -> dict:
+    """Read ``meta.json`` of an extract (the fetch settings the registered check needs)."""
+    path = Path(directory) / META_FILE
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"extract in {Path(directory)} has no {META_FILE}; run `python {FETCH_SCRIPT}` "
+            "once (needs the `fetch` extra and network access) to create it"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def load_extract(directory) -> City:
     """Read an extract written by :func:`save_extract` (or by the fetch script)."""
     src = Path(directory)
@@ -104,7 +116,7 @@ def load_extract(directory) -> City:
             "once (needs the `fetch` extra and network access) to create it"
         )
 
-    meta = json.loads((src / META_FILE).read_text(encoding="utf-8"))
+    meta = read_meta(src)
     crs = meta.get("crs")
     aoi = meta.get("aoi")
     if not isinstance(crs, str) or not isinstance(aoi, list) or len(aoi) != 4:
@@ -122,3 +134,68 @@ def load_extract(directory) -> City:
     edges = edges[list(EDGE_COLUMNS)].astype({"u": "int64", "v": "int64"}).reset_index(drop=True)
     facilities = facilities[list(FACILITY_COLUMNS)].reset_index(drop=True)
     return City(nodes, edges, facilities, crs, tuple(float(v) for v in aoi))
+
+
+# Coordinates smaller than this in absolute value look like degrees, not UTM metres.
+_DEGREE_LIMIT = 1000.0
+# The network must reach beyond the largest threshold (2,000 m) on every side of the AOI.
+_MIN_REACH_M = 2_000.0
+
+
+def check_registered_extract(city: City, meta: dict) -> list[str]:
+    """Why this extract cannot carry the registered analysis; an empty list means it can.
+
+    Checked: the CRS and AOI (to 1 m), the fetch margin recorded at download time, that the
+    nodes really reach 2,000 m beyond the AOI on every side, the facility kinds, and that no
+    coordinate looks like degrees. Each problem is one readable sentence.
+    """
+    problems: list[str] = []
+
+    if city.crs != registered.CRS:
+        problems.append(f"CRS is {city.crs}, the registered CRS is {registered.CRS}")
+
+    aoi = registered.registered_aoi()
+    if any(abs(a - b) > 1.0 for a, b in zip(city.aoi, aoi, strict=True)):
+        problems.append(
+            f"AOI {tuple(round(v, 1) for v in city.aoi)} differs by more than 1 m from the "
+            f"registered AOI {tuple(round(v, 1) for v in aoi)}"
+        )
+
+    margin = meta.get("fetch_buffer_m")
+    if not isinstance(margin, int | float) or isinstance(margin, bool):
+        problems.append("fetch_buffer_m is missing from meta.json")
+    elif margin < registered.FETCH_MARGIN_M:
+        problems.append(
+            f"fetch_buffer_m is {margin:g} m, below the registered {registered.FETCH_MARGIN_M} m"
+        )
+
+    nodes, fac = city.nodes, city.facilities
+    if len(nodes):
+        xmin, ymin, xmax, ymax = city.aoi
+        reach = {
+            "west": xmin - float(nodes["x"].min()),
+            "east": float(nodes["x"].max()) - xmax,
+            "south": ymin - float(nodes["y"].min()),
+            "north": float(nodes["y"].max()) - ymax,
+        }
+        short = [f"{side} {v:,.0f} m" for side, v in reach.items() if v < _MIN_REACH_M]
+        if short:
+            problems.append(
+                f"network nodes reach less than {_MIN_REACH_M:,.0f} m beyond the AOI on: "
+                + ", ".join(short)
+            )
+    else:
+        problems.append("the extract has no network nodes")
+
+    kinds = sorted(set(fac["kind"].astype(str)) - registered.ALLOWED_KINDS)
+    if kinds:
+        problems.append(f"facility kinds outside the registered set: {kinds}")
+
+    for name, frame in (("node", nodes), ("facility", fac)):
+        small = (frame["x"].abs() < _DEGREE_LIMIT) | (frame["y"].abs() < _DEGREE_LIMIT)
+        if bool(small.any()):
+            problems.append(
+                f"{int(small.sum())} {name} coordinates look like degrees, not metres "
+                f"(|x| or |y| < {_DEGREE_LIMIT:g})"
+            )
+    return problems
