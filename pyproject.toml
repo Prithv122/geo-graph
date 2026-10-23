@@ -1,0 +1,60 @@
+[project]
+name = "geo-graph"
+version = "0.1.0"
+description = "How much does a straight-line walking buffer overstate access to hospitals and clinics, compared with walking on the OpenStreetMap street network? Measured on Bengaluru with WorldPop population weights."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "h3>=4.1",
+    "networkx>=3.3",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=17",
+    "pyproj>=3.6",
+    "scipy>=1.13",
+    "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+# Local-only: downloads OpenStreetMap and WorldPop data. CI never installs it.
+fetch = [
+    "osmnx>=2.0",
+    "rasterio>=1.4",
+    "requests>=2.32",
+]
+maps = [
+    "matplotlib>=3.9",
+]
+
+# Console entry points need a real build backend: a uv virtual project
+# ([tool.uv] package = false) installs nothing, so the documented command fails
+# with "No module named ..." even while tests pass (pytest's pythonpath hides it).
+[project.scripts]
+geonet = "geonet.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Keep this path and the [project.scripts] target above in step when renaming the package.
+[tool.hatch.build.targets.wheel]
+packages = ["src/geonet"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
