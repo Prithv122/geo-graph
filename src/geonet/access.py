@@ -1,8 +1,10 @@
 """The two access arms and the full comparison.
 
 Both arms share destinations, origins, weights and threshold. Only the distance method
-differs: straight line to the nearest facility, or snap leg + shortest path + facility
-snap leg on the walking network. ``run_access`` returns one JSON-serialisable dict.
+differs: straight line to the nearest facility, or, on the walking network, the straight leg
+to the nearest street + the walk along it + the shortest path + the same on the facility's
+street. The nearest-node snap is kept as a sensitivity. ``run_access`` returns one
+JSON-serialisable dict.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import heapq
 import json
 import math
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +23,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from geonet.city import ORIGIN_COLUMNS, City, require_columns
-from geonet.network import Snapper, build_graph
+from geonet.network import EdgeSnapper, Snapper, build_graph
 from geonet.stats import (
     DEFAULT_ALPHA,
     DEFAULT_SEED,
@@ -30,6 +33,9 @@ from geonet.stats import (
     weighted_quantile,
     weighted_share,
 )
+
+FACILITY_KINDS = frozenset({"hospital", "clinic", "doctors"})  # the three registered tags
+LENGTH_SLACK_M = 1e-6  # a network distance may undercut the straight line by float noise only
 
 NetworkFn = Callable[[nx.Graph, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
 
@@ -91,20 +97,12 @@ def _labelled_dijkstra(
     return dist, label
 
 
-def network_distance_m(
+def _node_snap_distance_m(
     graph: nx.Graph, origins_xy: np.ndarray, facilities_xy: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Walking distance to the nearest facility: origin leg + path + facility leg.
-
-    One Dijkstra seeded at every facility's node (initial distance = its snap leg)
-    gives all origins at once. If two facilities snap to one node the shorter leg wins
-    (ties: lower index). Unreachable origins get ``inf`` and index -1. No cutoff: the
-    circuity statistic needs distances beyond the threshold.
-    """
+    """Nearest-node method (the sensitivity): leg to a node + path + leg from a node."""
     fac = np.asarray(facilities_xy, dtype=float).reshape(-1, 2)
     org = np.asarray(origins_xy, dtype=float).reshape(-1, 2)
-    if len(fac) == 0:
-        raise ValueError("at least one facility is required")
     snapper = Snapper(graph)
     f_nodes, f_leg = snapper.snap(fac)
     sources: dict[int, tuple[float, int]] = {}
@@ -123,6 +121,74 @@ def network_distance_m(
     return dist, idx
 
 
+def _edge_snap_distance_m(
+    graph: nx.Graph, origins_xy: np.ndarray, facilities_xy: np.ndarray, snapper: EdgeSnapper
+) -> tuple[np.ndarray, np.ndarray]:
+    """Registered method: join each point at the nearest street, walk along it to a node."""
+    fac = np.asarray(facilities_xy, dtype=float).reshape(-1, 2)
+    org = np.asarray(origins_xy, dtype=float).reshape(-1, 2)
+    f = snapper.snap(fac)
+    o = snapper.snap(org)
+
+    # Both ends of each facility's street are Dijkstra sources; strict "<" keeps the lower
+    # facility index when two reach a node at the same distance.
+    sources: dict[int, tuple[float, int]] = {}
+    on_edge: dict[int, list[int]] = defaultdict(list)
+    for k in range(len(fac)):
+        on_edge[int(f.edge[k])].append(k)
+        for node, extra in ((int(f.u[k]), f.along_u_m[k]), (int(f.v[k]), f.along_v_m[k])):
+            init = float(f.leg_m[k] + extra)
+            if node not in sources or init < sources[node][0]:
+                sources[node] = (init, k)
+    dist_map, label_map = _labelled_dijkstra(graph, sources)
+
+    dist = np.full(len(org), np.inf)
+    idx = np.full(len(org), -1, dtype=np.int64)
+    for i in range(len(org)):
+        best = (math.inf, -1)
+        leg = float(o.leg_m[i])
+        for node, along in ((int(o.u[i]), o.along_u_m[i]), (int(o.v[i]), o.along_v_m[i])):
+            if node in dist_map:
+                cand = (leg + float(along) + dist_map[node], label_map[node])
+                if cand < best:
+                    best = cand
+        # Origin and facility on one street: walking straight along it may beat any detour.
+        for k in on_edge.get(int(o.edge[i]), ()):
+            direct = leg + abs(float(o.pos_m[i] - f.pos_m[k])) + float(f.leg_m[k])
+            if (direct, k) < best:
+                best = (direct, k)
+        dist[i], idx[i] = best
+    return dist, idx
+
+
+def network_distance_m(
+    graph: nx.Graph,
+    origins_xy: np.ndarray,
+    facilities_xy: np.ndarray,
+    edges: pd.DataFrame | EdgeSnapper | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Walking distance to the nearest facility on the street network.
+
+    With ``edges`` (the registered method; a prebuilt ``EdgeSnapper`` also works) every
+    point joins the network at the closest point of the nearest street: distance =
+    origin leg + walk along its street to an end node + shortest path + walk along the
+    facility's street + facility leg, minimised over both ends on each side. Facilities on
+    the origin's own street add the direct walk along it. Ties go to the lower facility index.
+
+    Without ``edges`` points snap to the nearest node (the sensitivity method): leg + path +
+    leg. One Dijkstra seeded at every facility's source nodes gives all origins at once.
+    Unreachable origins get ``inf`` and index -1. No cutoff: the circuity statistic needs
+    distances beyond the threshold.
+    """
+    fac = np.asarray(facilities_xy, dtype=float).reshape(-1, 2)
+    if len(fac) == 0:
+        raise ValueError("at least one facility is required")
+    if edges is None:
+        return _node_snap_distance_m(graph, origins_xy, fac)
+    snapper = edges if isinstance(edges, EdgeSnapper) else EdgeSnapper(graph, edges)
+    return _edge_snap_distance_m(graph, origins_xy, fac, snapper)
+
+
 def _validate(city: City, origins: pd.DataFrame) -> pd.DataFrame:
     """Check the inputs and return the origins sorted by cell_id."""
     require_columns(origins, ORIGIN_COLUMNS, "origins")
@@ -130,6 +196,9 @@ def _validate(city: City, origins: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("origins is empty")
     if len(city.facilities) == 0:
         raise ValueError("the city has no facilities")
+    bad_kinds = sorted(set(city.facilities["kind"].astype(str)) - FACILITY_KINDS)
+    if bad_kinds:
+        raise ValueError(f"unknown facility kind {bad_kinds}, expected {sorted(FACILITY_KINDS)}")
     if origins["cell_id"].duplicated().any():
         raise ValueError("origins has duplicate cell_id values")
     pop = origins["pop"].to_numpy(dtype=float)
@@ -170,12 +239,18 @@ def run_access(
     n_boot: int = 2000,
     seed: int = DEFAULT_SEED,
     graph: nx.Graph | None = None,
+    registered: bool = False,
 ) -> dict:
     """Compute both arms once, classify at every threshold, and summarise.
 
-    ``network_fn(graph, origins_xy, facilities_xy) -> (dist, idx)`` replaces the network
-    arm. Passing the buffer distances through it must give a gap of exactly zero, which
-    is how the tests show that only the distance method differs.
+    The network arm snaps to the nearest street (``city.edges``). ``network_fn(graph,
+    origins_xy, facilities_xy) -> (dist, idx)`` replaces it. Passing the buffer distances
+    through it must give a gap of exactly zero, which is how the tests show that only the
+    distance method differs. The nearest-node snap is always computed as a sensitivity.
+
+    ``summary["verdict"]`` is the registered rule's outcome only with ``registered=True``
+    (the caller has checked the registered settings); otherwise it is None. Raises if any
+    network distance is shorter than the straight line.
     """
     cells = _validate(city, origins)
     if graph is None:
@@ -189,11 +264,22 @@ def run_access(
     cell_ids = cells["cell_id"].to_numpy()
 
     euclid, e_idx = buffer_distance_m(xy, fac_xy)
-    net_fn = network_fn if network_fn is not None else network_distance_m
-    network, n_idx = net_fn(graph, xy, fac_xy)
+    edge_snapper = EdgeSnapper(graph, city.edges)
+    if network_fn is not None:
+        network, n_idx = network_fn(graph, xy, fac_xy)
+    else:
+        network, n_idx = network_distance_m(graph, xy, fac_xy, edge_snapper)
     network = np.asarray(network, dtype=float)
     n_idx = np.asarray(n_idx, dtype=np.int64)
-    _, snap = Snapper(graph).snap(xy)
+    short = network < euclid - LENGTH_SLACK_M
+    if short.any():
+        i = int(np.argmax(short))
+        raise ValueError(
+            f"{int(short.sum())} network distances are shorter than the straight line, "
+            f"e.g. cell {cells['cell_id'].iat[i]}: {network[i]:.3f} m < {euclid[i]:.3f} m"
+        )
+    node_network, _ = network_distance_m(graph, xy, fac_xy)
+    snap = edge_snapper.snap(xy).leg_m
 
     def classify(threshold: float) -> tuple[np.ndarray, np.ndarray]:
         return euclid <= threshold, network <= threshold  # inf compares False
@@ -221,6 +307,7 @@ def run_access(
     gap = gap_pp(pop, b_ok, n_ok)
     ci_cluster = ci(b_ok, n_ok, cluster)
     ci_cell = ci(b_ok, n_ok, cell_ids)
+    node_ok = node_network <= threshold
 
     usable = (euclid > 0) & np.isfinite(network)
     circuity = np.where(usable, network / np.where(euclid > 0, euclid, 1.0), np.nan)
@@ -233,7 +320,14 @@ def run_access(
         "gap_pp": gap,
         "ci_cluster": ci_cluster,
         "ci_cell": ci_cell,
-        "verdict": verdict(gap, *ci_cluster),
+        "registered": bool(registered),
+        "verdict": verdict(gap, *ci_cluster) if registered else None,
+        "snap_method": "edge",
+        "node_snap_sensitivity": {
+            "share_network": weighted_share(pop, node_ok),
+            "gap_pp": gap_pp(pop, b_ok, node_ok),
+            "ci_cluster": ci(b_ok, node_ok, cluster),
+        },
         "n_cells": len(cells),
         "n_clusters": len(np.unique(cluster)),
         "pop_total": float(pop.sum()),
@@ -242,7 +336,7 @@ def run_access(
         "circuity_p90": _num(weighted_quantile(circuity, pop, 0.9)),
         "snap_median_m": _num(weighted_quantile(snap, pop, 0.5)),
         "snap_over_200m_share": weighted_share(pop, snap > 200.0),
-        "network_ge_euclid": bool(np.all(network >= euclid - 1e-6)),
+        "network_ge_euclid": bool(np.all(network >= euclid - LENGTH_SLACK_M)),
     }
 
     zones = []

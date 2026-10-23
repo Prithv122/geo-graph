@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import itertools
 import json
 import math
+from collections import defaultdict
 
 import networkx as nx
 import numpy as np
@@ -19,11 +21,32 @@ from geonet.access import (
     write_access_json,
 )
 from geonet.city import City
-from geonet.network import Snapper, build_graph
+from geonet.network import EdgeSnapper, Snapper, build_graph
 from geonet.synthetic import closed_form_euclid_m, closed_form_network_m, synthetic_city
 
 N_BOOT = 200
 RIVER = {"river_row": 5, "bridge_col": 6}
+SUMMARY_KEYS = {
+    "threshold_m",
+    "share_buffer",
+    "share_network",
+    "gap_pp",
+    "ci_cluster",
+    "ci_cell",
+    "registered",
+    "verdict",
+    "snap_method",
+    "node_snap_sensitivity",
+    "n_cells",
+    "n_clusters",
+    "pop_total",
+    "pop_affected",
+    "circuity_median",
+    "circuity_p90",
+    "snap_median_m",
+    "snap_over_200m_share",
+    "network_ge_euclid",
+}
 HALF_KM = AccessConfig(6, 5)  # 500 m exactly
 
 
@@ -117,12 +140,22 @@ def test_swapping_network_for_buffer_distance_gives_zero_gap_everywhere() -> Non
     assert res["summary"]["gap_pp"] == 0.0
     assert res["summary"]["share_buffer"] == res["summary"]["share_network"]
     assert res["summary"]["ci_cluster"] == [0.0, 0.0]
-    assert res["summary"]["verdict"] == "null"
+    assert res["summary"]["verdict"] is None  # not the registered run
+    assert res["summary"]["node_snap_sensitivity"]["gap_pp"] >= 0.0
     for row in res["sensitivity"]:
         assert row["gap_pp"] == 0.0
         assert row["share_buffer"] == row["share_network"]
     assert all(z["gap_pp"] == 0.0 for z in res["zones"])
     assert res["summary"]["circuity_median"] == 1.0
+    registered = run_access(
+        city,
+        origins,
+        SENSITIVITY_GRID,
+        network_fn=lambda g, o, f: buffer_distance_m(o, f),
+        n_boot=N_BOOT,
+        registered=True,
+    )
+    assert registered["summary"]["verdict"] == "null"
 
 
 # ---- sensitivity grid -------------------------------------------------------------------
@@ -308,6 +341,8 @@ def test_output_shape_and_zones() -> None:
     assert sum(z["pop_affected"] for z in res["zones"]) == pytest.approx(s["pop_affected"])
     assert sum(z["pop"] for z in res["zones"]) == pytest.approx(s["pop_total"])
     assert 0 <= s["snap_over_200m_share"] <= 1
+    assert set(s) == SUMMARY_KEYS
+    assert s["snap_method"] == "edge" and s["registered"] is False and s["verdict"] is None
     json.dumps(res, allow_nan=False)
 
 
@@ -363,3 +398,262 @@ def test_two_runs_are_byte_identical(tmp_path) -> None:
     text = p1.read_text(encoding="utf-8")
     assert text.endswith("}\n") and not text.endswith("\n\n")
     assert json.loads(text)["summary"]["n_cells"] == 144
+
+
+# ---- street snapping (Amendment 1) -------------------------------------------------------
+
+
+def _street_city(origin_y: float = 0.0):
+    """One straight street, nodes at x = 0, 400, 1000, a hospital at its far end."""
+    nodes = pd.DataFrame({"node_id": [0, 1, 2], "x": [0.0, 400.0, 1000.0], "y": [0.0] * 3})
+    edges = pd.DataFrame(
+        [(0, 1, 400.0, "residential", None), (1, 2, 600.0, "residential", None)],
+        columns=["u", "v", "length_m", "highway", "geometry"],
+    )
+    fac = pd.DataFrame({"fid": ["h0"], "kind": ["hospital"], "x": [1000.0], "y": [0.0]})
+    city = City(nodes, edges, fac, "LOCAL:metres", (0.0, -100.0, 1000.0, 100.0))
+    return city, build_graph(nodes, edges), np.array([[190.0, origin_y]])
+
+
+def test_edge_method_beats_the_nearest_node_on_a_long_street() -> None:
+    city, graph, org = _street_city()
+    fac = city.facilities[["x", "y"]].to_numpy()
+    edge, e_idx = network_distance_m(graph, org, fac, city.edges)
+    node, _ = network_distance_m(graph, org, fac)
+    assert edge[0] == 810.0 and e_idx[0] == 0
+    assert node[0] == 1190.0
+
+
+def test_origin_off_the_street_adds_its_leg() -> None:
+    city, graph, org = _street_city(origin_y=30.0)
+    fac = city.facilities[["x", "y"]].to_numpy()
+    edge, _ = network_distance_m(graph, org, fac, city.edges)
+    assert edge[0] == pytest.approx(30.0 + 810.0)
+
+
+def test_prebuilt_snapper_gives_the_same_distances() -> None:
+    city, graph, org = _street_city(origin_y=12.0)
+    fac = city.facilities[["x", "y"]].to_numpy()
+    a = network_distance_m(graph, org, fac, city.edges)
+    b = network_distance_m(graph, org, fac, EdgeSnapper(graph, city.edges))
+    np.testing.assert_array_equal(a[0], b[0])
+    np.testing.assert_array_equal(a[1], b[1])
+
+
+def _one_long_edge() -> tuple[nx.Graph, pd.DataFrame]:
+    nodes = pd.DataFrame({"node_id": [0, 1], "x": [0.0, 900.0], "y": [0.0, 0.0]})
+    edges = pd.DataFrame(
+        [(0, 1, 900.0, "residential", None)],
+        columns=["u", "v", "length_m", "highway", "geometry"],
+    )
+    return build_graph(nodes, edges), edges
+
+
+def test_origin_and_facility_on_one_edge_walk_directly() -> None:
+    graph, edges = _one_long_edge()
+    fac = np.array([[600.0, 0.0]])  # 300 m from node 1
+    org = np.array([[300.0, 0.0]])  # 300 m from node 0
+    dist, idx = network_distance_m(graph, org, fac, edges)
+    assert dist[0] == pytest.approx(300.0) and idx[0] == 0
+    # legs add: 20 m off the street on one side, 10 m on the other
+    dist, _ = network_distance_m(
+        graph, np.array([[300.0, 20.0]]), np.array([[600.0, -10.0]]), edges
+    )
+    assert dist[0] == pytest.approx(20.0 + 300.0 + 10.0)
+    # the facility behind the origin is reached the other way round
+    dist, _ = network_distance_m(graph, fac, org, edges)
+    assert dist[0] == pytest.approx(300.0)
+
+
+def test_same_edge_ties_go_to_the_lower_facility_index() -> None:
+    graph, edges = _one_long_edge()
+    fac = np.array([[600.0, 0.0], [200.0, 0.0], [400.0, 0.0]])  # 100 m either side of x = 300
+    dist, idx = network_distance_m(graph, np.array([[300.0, 0.0]]), fac, edges)
+    assert dist[0] == pytest.approx(100.0) and idx[0] == 1
+
+
+def test_facility_on_a_reversed_geometry_edge() -> None:
+    nodes = pd.DataFrame({"node_id": [0, 1, 2], "x": [0.0, 1000.0, 1000.0], "y": [0.0, 0.0, 500.0]})
+    edges = pd.DataFrame(
+        [
+            (0, 1, 1000.0, "residential", "LINESTRING (1000 0, 0 0)"),  # stored v -> u
+            (1, 2, 500.0, "residential", None),
+        ],
+        columns=["u", "v", "length_m", "highway", "geometry"],
+    )
+    graph = build_graph(nodes, edges)
+    fac = np.array([[800.0, 0.0]])  # 200 m from node 1, 800 m from node 0
+    dist, _ = network_distance_m(graph, np.array([[1000.0, 500.0]]), fac, edges)
+    assert dist[0] == pytest.approx(500.0 + 200.0)
+    dist, _ = network_distance_m(graph, np.array([[0.0, 0.0]]), fac, edges)
+    assert dist[0] == pytest.approx(800.0)
+
+
+def _curved_city(seed: int, stretch: bool) -> tuple[City, pd.DataFrame]:
+    """The random Delaunay city with some edges replaced by 2-segment curves (half reversed)."""
+    city, origins = _random_city(seed, stretch=stretch)
+    rng = np.random.default_rng(seed + 1000)
+    xy = city.nodes.set_index("node_id")[["x", "y"]]
+    edges = city.edges.copy()
+    for row in rng.choice(len(edges), size=len(edges) // 4, replace=False):
+        u, v = int(edges["u"].iat[row]), int(edges["v"].iat[row])
+        (x1, y1), (x2, y2) = xy.loc[u].to_numpy(), xy.loc[v].to_numpy()
+        mx, my = (x1 + x2) / 2 + rng.normal(0, 40), (y1 + y2) / 2 + rng.normal(0, 40)
+        pts = [(x1, y1), (mx, my), (x2, y2)]
+        if rng.random() < 0.5:
+            pts = pts[::-1]
+        edges.loc[edges.index[row], "geometry"] = (
+            "LINESTRING (" + ", ".join(f"{float(x)!r} {float(y)!r}" for x, y in pts) + ")"
+        )
+        edges.loc[edges.index[row], "length_m"] = float(np.hypot(mx - x1, my - y1)) + float(
+            np.hypot(x2 - mx, y2 - my)
+        )
+    return City(city.nodes, edges, city.facilities, city.crs, city.aoi), origins
+
+
+def _split_edge_reference(snapper: EdgeSnapper, org_xy: np.ndarray, fac_xy: np.ndarray):
+    """Brute force: insert the origin and each facility as nodes that split their snapped edge."""
+    f, o = snapper.snap(fac_xy), snapper.snap(org_xy)
+    dist = np.empty(len(org_xy))
+    per_fac = np.empty((len(org_xy), len(fac_xy)))
+    for i in range(len(org_xy)):
+        on_edge: dict[int, list[tuple[float, object]]] = defaultdict(list)
+        for k in range(len(fac_xy)):
+            on_edge[int(f.edge[k])].append((float(f.pos_m[k]), ("f", k)))
+        on_edge[int(o.edge[i])].append((float(o.pos_m[i]), "o"))
+        g = nx.Graph()
+        for e in range(len(snapper)):
+            chain = [(0.0, int(snapper.u[e]))]
+            chain += sorted(on_edge.get(e, []), key=lambda t: t[0])
+            chain.append((float(snapper.length_m[e]), int(snapper.v[e])))
+            for (p1, a), (p2, b) in itertools.pairwise(chain):
+                g.add_edge(a, b, w=p2 - p1)
+        d = nx.single_source_dijkstra_path_length(g, "o", weight="w")
+        per_fac[i] = [o.leg_m[i] + d[("f", k)] + f.leg_m[k] for k in range(len(fac_xy))]
+        dist[i] = per_fac[i].min()
+    return dist, per_fac
+
+
+@pytest.mark.parametrize("seed", [31, 32, 33, 34, 35])
+@pytest.mark.parametrize("stretch", [False, True])
+def test_edge_method_matches_split_edge_reference(seed: int, stretch: bool) -> None:
+    city, origins = _curved_city(seed, stretch)
+    graph = build_graph(city.nodes, city.edges)
+    snapper = EdgeSnapper(graph, city.edges)
+    org = origins[["x", "y"]].to_numpy()
+    fac = city.facilities[["x", "y"]].to_numpy()
+    dist, idx = network_distance_m(graph, org, fac, snapper)
+    ref, per_fac = _split_edge_reference(snapper, org, fac)
+    np.testing.assert_allclose(dist, ref, rtol=0, atol=1e-7)
+    assert (idx >= 0).all()
+    np.testing.assert_allclose(per_fac[np.arange(len(org)), idx], ref, rtol=0, atol=1e-7)
+    euclid, _ = buffer_distance_m(org, fac)
+    assert (dist >= euclid - 1e-6).all()
+
+
+@pytest.mark.parametrize("seed", [31, 32, 33])
+def test_edge_method_with_many_facilities_sharing_streets(seed: int) -> None:
+    city, origins = _curved_city(seed, stretch=False)
+    fac = np.random.default_rng(seed).random((40, 2)) * 1000.0
+    graph = build_graph(city.nodes, city.edges)
+    snapper = EdgeSnapper(graph, city.edges)
+    org = origins[["x", "y"]].to_numpy()
+    assert len(set(snapper.snap(fac).edge.tolist())) < 40  # some streets hold several
+    dist, idx = network_distance_m(graph, org, fac, snapper)
+    ref, per_fac = _split_edge_reference(snapper, org, fac)
+    np.testing.assert_allclose(dist, ref, rtol=0, atol=1e-7)
+    np.testing.assert_allclose(per_fac[np.arange(len(org)), idx], ref, rtol=0, atol=1e-7)
+
+
+@pytest.mark.parametrize("seed", [41, 42, 43])
+def test_run_access_on_curved_streets_keeps_network_above_straight_line(seed: int) -> None:
+    city, origins = _curved_city(seed, stretch=True)
+    res = run_access(city, origins, [PRIMARY], n_boot=N_BOOT)
+    assert res["summary"]["network_ge_euclid"] is True
+    assert (_by_cell(res, "network_m").astype(float) >= _by_cell(res, "euclid_m") - 1e-6).all()
+    assert (_by_cell(res, "snap_m") >= 0).all()
+
+
+# ---- run_access guards, snapping outputs, sensitivity ------------------------------------
+
+
+def test_network_fn_below_the_straight_line_raises() -> None:
+    city, origins = synthetic_city(**RIVER)
+
+    def too_short(graph, org, fac):
+        dist, idx = buffer_distance_m(org, fac)
+        return dist * 0.5, idx
+
+    with pytest.raises(ValueError, match="shorter than the straight line"):
+        run_access(city, origins, [PRIMARY], network_fn=too_short, n_boot=N_BOOT)
+
+
+def test_unknown_facility_kind_raises() -> None:
+    city, origins = synthetic_city()
+
+    def with_kinds(kinds: list[str]) -> City:
+        fac = city.facilities.assign(kind=kinds)
+        return City(city.nodes, city.edges, fac, city.crs, city.aoi)
+
+    with pytest.raises(ValueError, match="facility kind"):
+        run_access(with_kinds(["hospital", "pharmacy"]), origins, [PRIMARY], n_boot=N_BOOT)
+    run_access(with_kinds(["clinic", "doctors"]), origins, [PRIMARY], n_boot=N_BOOT)
+
+
+def test_verdict_only_for_the_registered_run() -> None:
+    city, origins = synthetic_city(pop_seed=7, **RIVER)
+    plain = run_access(city, origins, [HALF_KM], primary=HALF_KM, n_boot=N_BOOT)["summary"]
+    reg = run_access(city, origins, [HALF_KM], primary=HALF_KM, n_boot=N_BOOT, registered=True)
+    assert plain["registered"] is False and plain["verdict"] is None
+    assert reg["summary"]["registered"] is True
+    assert reg["summary"]["verdict"] in {"supported", "null", "not_supported"}
+    assert reg["summary"]["gap_pp"] == plain["gap_pp"]
+
+
+def test_node_snap_sensitivity_on_the_river_grid_equals_the_edge_arm() -> None:
+    city, origins = synthetic_city(pop_seed=9, **RIVER)
+    s = run_access(city, origins, [HALF_KM], primary=HALF_KM, n_boot=N_BOOT)["summary"]
+    node = s["node_snap_sensitivity"]
+    assert set(node) == {"share_network", "gap_pp", "ci_cluster"}
+    assert node["gap_pp"] >= s["gap_pp"]
+    # grid points sit on nodes, so both snaps give the same walk
+    assert node["share_network"] == s["share_network"]
+    assert node["gap_pp"] == s["gap_pp"]
+    assert node["ci_cluster"] == s["ci_cluster"]
+    assert s["snap_method"] == "edge"
+
+
+def test_node_snap_sensitivity_exposes_the_snapping_bias() -> None:
+    city, _, _ = _street_city()
+    origins = pd.DataFrame(
+        {
+            "cell_id": ["a", "b"],
+            "x": [190.0, 1000.0],
+            "y": [0.0, 0.0],
+            "pop": [1.0, 1.0],
+            "cluster": ["z", "z"],
+        }
+    )
+    cfg = AccessConfig(6, 10)  # 1,000 m
+    s = run_access(city, origins, [cfg], primary=cfg, n_boot=N_BOOT)["summary"]
+    assert s["gap_pp"] == 0.0  # edge method: 810 m and 0 m are both inside 1,000 m
+    assert s["node_snap_sensitivity"]["share_network"] == 0.5  # nearest node: 1,190 m is not
+    assert s["node_snap_sensitivity"]["gap_pp"] == pytest.approx(50.0)
+
+
+def test_snap_m_is_the_leg_to_the_nearest_street() -> None:
+    city, _, _ = _street_city()
+    origins = pd.DataFrame(
+        {
+            "cell_id": ["a", "b"],
+            "x": [190.0, 700.0],
+            "y": [30.0, 0.0],
+            "pop": [1.0, 3.0],
+            "cluster": ["z", "z"],
+        }
+    )
+    res = run_access(city, origins, [PRIMARY], n_boot=N_BOOT)
+    legs = _by_cell(res, "snap_m")
+    assert legs["a"] == pytest.approx(30.0) and legs["b"] == 0.0  # not the 192 m to a node
+    assert res["summary"]["snap_median_m"] == 0.0  # weighted: the 3-person cell is on the street
+    assert res["summary"]["snap_over_200m_share"] == 0.0
