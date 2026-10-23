@@ -19,11 +19,11 @@ for the one-off data download, `maps` (matplotlib) for the figures.
 
 ## Acceptance criteria
 
-- [ ] Both arms share destinations, study area, population weights and threshold; a test asserts
+- [x] Both arms share destinations, study area, population weights and threshold; a test asserts
       that only the distance method differs.
-- [ ] Network share equals the closed form on the synthetic grid; buffer overstates on the grid
+- [x] Network share equals the closed form on the synthetic grid; buffer overstates on the grid
       with a river.
-- [ ] Real run on the committed Bengaluru extract: gap in pp with a 95% cluster-bootstrap CI,
+- [x] Real run on the committed Bengaluru extract: gap in pp with a 95% cluster-bootstrap CI,
       the 3 x 3 sensitivity grid, the per-zone gap map, and the H1 verdict as registered.
 - [ ] Runs from a clean clone using only the documented steps; tests, lint and CI green.
 
@@ -35,10 +35,11 @@ All x/y are metres in the extract's projected CRS (Bengaluru: EPSG:32643, UTM 43
 |---|---|
 | `city.py` | `City(nodes, edges, facilities, crs, aoi)` and the column schemas |
 | `synthetic.py` | `synthetic_city(...) -> (City, origins)`, closed-form distances |
-| `network.py` | `build_graph(nodes, edges)` (undirected, `length_m`, largest component), `Snapper(graph).snap(xy) -> (node_ids, dist_m)` |
+| `network.py` | `build_graph` (undirected, `length_m` >= chord, largest component), `EdgeSnapper` (nearest street), `Snapper` (nearest node, sensitivity) |
 | `osm.py` | `load_extract(dir) -> City`, `save_extract(city, dir)`, `to_projected` / `to_lonlat` |
 | `hexgrid.py` | `load_pop(csv)`, `cells_to_origins(pop_df, crs, parent_res=7) -> origins` |
-| `access.py` | `buffer_distance_m`, `network_distance_m`, `run_access(city, origins, configs) -> dict` |
+| `registered.py` | the registered constants and the registered-run decision |
+| `access.py` | `buffer_distance_m`, `network_distance_m` (street snapping), `run_access(...) -> dict` |
 | `stats.py` | `weighted_share`, `gap_pp`, `cluster_bootstrap_ci` |
 | `report.py` | markdown tables, maps (`maps` extra), the spot-check sheet |
 | `cli.py` | `geonet build`, `geonet access`, `geonet report` |

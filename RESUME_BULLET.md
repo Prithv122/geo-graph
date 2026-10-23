@@ -1,30 +1,28 @@
 # Resume Bullets — Walkable Access
 
-Form: **action → technical specifics → measured outcome.** Numbers or it doesn't go on the resume.
+Form: **action → technical specifics → measured outcome.** Draft; the owner picks the wording.
 
 ---
 
 ## Bullets
 
-- _..._
-- _..._
+- Measured how much straight-line buffers overstate walking access to healthcare for 1.06M residents
+  of central Bengaluru, using OpenStreetMap streets (78k nodes), WorldPop population on H3 cells and a
+  pre-registered decision rule: a 2.9 pp gap at 15 minutes (95% cluster-bootstrap CI 1.3–5.0, below
+  the 5 pp bar), concentrated in neighbourhoods where it reaches 20 pp, and 9.9 pp at 10 minutes.
+- Caught and fixed a one-directional bias before the real run (nearest-node snapping lengthens walks,
+  which inflates the gap) by snapping to the nearest street segment; validated against a closed-form
+  grid, a brute-force graph reference, and a test that reproduces the committed results to 1e-9.
 
 ## Which roles this supports
 
-- [ ] Data Scientist / ML
+- [x] Data Scientist / ML
 - [ ] AI Engineer (LLM/NLP/CV)
-- [ ] Data Engineer
-- [ ] Data Analyst / Python Developer
+- [x] Data Engineer
+- [x] Data Analyst / Python Developer
 
 ## Keywords this project earns
 
-_Only list what you actually used and could be questioned on._
-
----
-
-### Bad vs good
-
-❌ "Built a machine learning model to predict customer churn using Python."
-✅ "Built a churn classifier on 240k accounts (LightGBM, 1:40 class imbalance) with isotonic calibration and cost-sensitive thresholding, lifting precision@10% from 0.31 to 0.58 over the business's existing rules baseline."
-
-The second one is answerable in an interview. The first invites the question you can't answer.
+Geospatial analysis · OpenStreetMap · network analysis (Dijkstra, multi-source shortest paths) ·
+H3 · coordinate reference systems (UTM) · shapely / pyproj · population weighting · cluster
+bootstrap · pre-registration · sensitivity analysis
