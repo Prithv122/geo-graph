@@ -121,3 +121,14 @@ Changes (everything else above stands):
 8. **Stated limits:** the AOI holds about 27 resolution-7 zones, and a percentile bootstrap over so
    few clusters can still be too narrow; the resolution-10 sensitivity mostly measures how 100 m
    raster pixels fall into smaller cells, not finer population.
+
+## Amendment 2 — 2026-10-23, before any real-city access number
+
+Reason: the first registered run stopped at input validation, before any distance was computed.
+Population is assigned to H3 cells by pixel centre inside the AOI (as registered), so 52 of the 973
+resolution-9 cells on the AOI edge hold residents from inside the AOI while their centroid, the
+origin point, lies just outside it. The validator required every origin inside the AOI.
+
+Change: an origin may lie up to 250 m outside the AOI (a resolution-9 cell's centroid is at most
+about 175 m from any point of the cell). Population is still counted inside the AOI only, and the
+network and facilities still extend 2,500 m beyond it. No cell is dropped and nothing else changes.

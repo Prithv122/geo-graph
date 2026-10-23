@@ -356,9 +356,13 @@ def test_snapping_is_measured_for_off_node_origins() -> None:
 def test_validation_errors() -> None:
     city, origins = synthetic_city()
     outside = origins.copy()
-    outside.loc[0, "x"] = -5.0
+    outside.loc[0, "x"] = -260.0
     with pytest.raises(ValueError, match="outside the AOI"):
         run_access(city, outside, [PRIMARY], n_boot=N_BOOT)
+    # A cell centroid just past the edge (a boundary cell, Amendment 2) is accepted.
+    edge_cell = origins.copy()
+    edge_cell.loc[0, "x"] = -240.0
+    run_access(city, edge_cell, [PRIMARY], n_boot=N_BOOT)
     with pytest.raises(ValueError, match="empty"):
         run_access(city, origins.iloc[0:0], [PRIMARY], n_boot=N_BOOT)
     no_fac = City(city.nodes, city.edges, city.facilities.iloc[0:0], city.crs, city.aoi)

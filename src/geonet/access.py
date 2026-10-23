@@ -189,6 +189,12 @@ def network_distance_m(
     return _edge_snap_distance_m(graph, origins_xy, fac, snapper)
 
 
+# Amendment 2: population is counted by pixel centre inside the AOI, so a cell on the AOI edge
+# has residents inside it while its centroid (the origin point) may sit just outside. A
+# resolution-9 cell's centroid is at most about 175 m from any point in the cell.
+AOI_ORIGIN_TOLERANCE_M = 250.0
+
+
 def _validate(city: City, origins: pd.DataFrame) -> pd.DataFrame:
     """Check the inputs and return the origins sorted by cell_id."""
     require_columns(origins, ORIGIN_COLUMNS, "origins")
@@ -209,10 +215,13 @@ def _validate(city: City, origins: pd.DataFrame) -> pd.DataFrame:
     x = origins["x"].to_numpy(dtype=float)
     y = origins["y"].to_numpy(dtype=float)
     xmin, ymin, xmax, ymax = city.aoi
-    inside = (x >= xmin) & (x <= xmax) & (y >= ymin) & (y <= ymax)
+    tol = AOI_ORIGIN_TOLERANCE_M
+    inside = (x >= xmin - tol) & (x <= xmax + tol) & (y >= ymin - tol) & (y <= ymax + tol)
     if not inside.all():
         bad = origins.loc[~inside, "cell_id"].tolist()[:3]
-        raise ValueError(f"{int((~inside).sum())} origins lie outside the AOI, e.g. {bad}")
+        raise ValueError(
+            f"{int((~inside).sum())} origins lie more than {tol:g} m outside the AOI, e.g. {bad}"
+        )
     return origins.sort_values("cell_id", kind="stable").reset_index(drop=True)
 
 
