@@ -1,0 +1,38 @@
+{
+  "aoi": [
+    776481.0,
+    1430426.0,
+    786481.0,
+    1440426.0
+  ],
+  "aoi_size_m": 10000,
+  "centre_lonlat": [
+    77.5946,
+    12.9716
+  ],
+  "counts": {
+    "edges": 218356,
+    "facilities": {
+      "clinic": 634,
+      "doctors": 57,
+      "hospital": 728
+    },
+    "nodes": 79707
+  },
+  "crs": "EPSG:32643",
+  "fetch_bbox_lonlat": [
+    77.524833,
+    12.903151,
+    77.664404,
+    13.040031
+  ],
+  "fetch_buffer_m": 2500,
+  "fetched_at": "2026-10-23T16:44:17+00:00",
+  "geometry_simplified_m": 0,
+  "osm_timestamp": "2026-10-23T16:45:51Z",
+  "osm_timestamps_by_response": [
+    "2026-10-23T16:45:51Z",
+    "2026-10-23T16:53:51Z"
+  ],
+  "source": "OpenStreetMap via the Overpass API, osmnx 2.1.1, network_type=walk"
+}
