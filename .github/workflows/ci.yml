@@ -21,7 +21,7 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --extra maps
 
       - name: Lint
         run: |
@@ -30,3 +30,9 @@ jobs:
 
       - name: Test
         run: uv run pytest --cov=src --cov-report=term-missing
+
+      - name: Smoke (synthetic grid, no network)
+        run: |
+          uv run geonet build --synthetic
+          uv run geonet access --synthetic --n-boot 200
+          uv run geonet report --access results/synthetic/access.json

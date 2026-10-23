@@ -30,6 +30,10 @@ data/processed/
 *.db
 *.sqlite3
 !data/sample/**
+# The committed OSM extract (a few MB, ODbL) is the analysis input
+!data/osm/*.parquet
+# Synthetic runs are for checking the pipeline, not results
+results/synthetic/
 
 # Models & artifacts
 /models/
